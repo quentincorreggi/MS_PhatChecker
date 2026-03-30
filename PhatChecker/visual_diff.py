@@ -621,6 +621,18 @@ document.querySelectorAll('.full-img').forEach(img => {{
         document.getElementById('lightbox').classList.add('active');
     }});
 }});
+function natCmp(a, b) {{
+    const re = /(\d+|\D+)/g;
+    const pa = a.match(re) || [], pb = b.match(re) || [];
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {{
+        if (i >= pa.length) return -1;
+        if (i >= pb.length) return 1;
+        const na = parseInt(pa[i]), nb = parseInt(pb[i]);
+        if (!isNaN(na) && !isNaN(nb)) {{ if (na !== nb) return na - nb; }}
+        else {{ const c = pa[i].localeCompare(pb[i]); if (c) return c; }}
+    }}
+    return 0;
+}}
 function sortCards(mode, btn) {{
     document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
@@ -630,8 +642,8 @@ function sortCards(mode, btn) {{
         cards.sort((a, b) => {{
             if (mode === 'change-desc') return parseFloat(b.dataset.change) - parseFloat(a.dataset.change);
             if (mode === 'change-asc') return parseFloat(a.dataset.change) - parseFloat(b.dataset.change);
-            if (mode === 'name-asc') return a.dataset.level.localeCompare(b.dataset.level);
-            if (mode === 'name-desc') return b.dataset.level.localeCompare(a.dataset.level);
+            if (mode === 'name-asc') return natCmp(a.dataset.level, b.dataset.level);
+            if (mode === 'name-desc') return natCmp(b.dataset.level, a.dataset.level);
             return 0;
         }});
         cards.forEach(c => container.appendChild(c));
