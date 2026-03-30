@@ -413,7 +413,7 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
             results.append(result)
 
     elapsed = time.time() - start
-    results.sort(key=lambda r: r["score"])
+    results.sort(key=lambda r: r["change_pct"], reverse=True)
 
     print(f"\nDone in {elapsed:.1f}s")
 
@@ -447,7 +447,7 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     for r in failed:
         imgs = r["images"]
         rows_failed += f'''
-        <div class="level-card fail" onclick="this.classList.toggle('expanded')">
+        <div class="level-card fail" data-level="{r['level'].lower()}" data-change="{r['change_pct']}" onclick="this.classList.toggle('expanded')">
             <div class="card-header">
                 <span class="status-badge fail">FAIL</span>
                 <span class="level-name">{r['level']}</span>
@@ -489,7 +489,7 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     for r in passed:
         imgs = r["images"]
         rows_passed += f'''
-        <div class="level-card pass">
+        <div class="level-card pass" data-level="{r['level'].lower()}" data-change="{r['change_pct']}">
             <div class="card-header">
                 <span class="status-badge pass">PASS</span>
                 <span class="level-name">{r['level']}</span>
@@ -539,6 +539,10 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     .filter-bar input {{ background: #16213e; border: 1px solid #333; color: #e0e0e0; padding: 8px 14px; border-radius: 8px; font-size: 14px; width: 300px; }}
     .filter-bar .filter-btn {{ background: #16213e; border: 1px solid #333; color: #e0e0e0; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; }}
     .filter-bar .filter-btn.active {{ background: #0f3460; border-color: #64b5f6; color: #64b5f6; }}
+    .sort-group {{ display: flex; align-items: center; gap: 6px; margin-left: auto; }}
+    .sort-label {{ font-size: 13px; color: #888; white-space: nowrap; }}
+    .sort-btn {{ background: #16213e; border: 1px solid #333; color: #e0e0e0; padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; white-space: nowrap; }}
+    .sort-btn.active {{ background: #0f3460; border-color: #64b5f6; color: #64b5f6; }}
     .level-card {{ background: #16213e; border-radius: 10px; margin-bottom: 8px; overflow: hidden; }}
     .level-card.fail {{ border-left: 4px solid #f44336; }}
     .level-card.pass {{ border-left: 4px solid #4caf50; }}
@@ -591,6 +595,13 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     <button class="filter-btn active" onclick="setFilter('all', this)">All</button>
     <button class="filter-btn" onclick="setFilter('fail', this)">Failures only</button>
     <button class="filter-btn" onclick="setFilter('pass', this)">Passed only</button>
+    <div class="sort-group">
+        <span class="sort-label">Sort:</span>
+        <button class="sort-btn active" onclick="sortCards('change-desc', this)">Change High-Low</button>
+        <button class="sort-btn" onclick="sortCards('change-asc', this)">Change Low-High</button>
+        <button class="sort-btn" onclick="sortCards('name-asc', this)">Name A-Z</button>
+        <button class="sort-btn" onclick="sortCards('name-desc', this)">Name Z-A</button>
+    </div>
 </div>
 {missing_html}
 <div class="section" id="results-section">
@@ -610,6 +621,22 @@ document.querySelectorAll('.full-img').forEach(img => {{
         document.getElementById('lightbox').classList.add('active');
     }});
 }});
+function sortCards(mode, btn) {{
+    document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    ['failed-list', 'passed-list'].forEach(id => {{
+        const container = document.getElementById(id);
+        const cards = Array.from(container.querySelectorAll('.level-card'));
+        cards.sort((a, b) => {{
+            if (mode === 'change-desc') return parseFloat(b.dataset.change) - parseFloat(a.dataset.change);
+            if (mode === 'change-asc') return parseFloat(a.dataset.change) - parseFloat(b.dataset.change);
+            if (mode === 'name-asc') return a.dataset.level.localeCompare(b.dataset.level);
+            if (mode === 'name-desc') return b.dataset.level.localeCompare(a.dataset.level);
+            return 0;
+        }});
+        cards.forEach(c => container.appendChild(c));
+    }});
+}}
 let currentFilter = 'all';
 function setFilter(filter, btn) {{
     currentFilter = filter;
