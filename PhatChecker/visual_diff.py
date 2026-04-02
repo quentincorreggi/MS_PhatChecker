@@ -134,38 +134,19 @@ def create_mask_overlay(img, masks, image_size):
 # Color normalization (color-invariant comparison)
 # ---------------------------------------------------------------------------
 
-def _kmeans_quantize(pixels, n_colors):
-    """
-    Cluster pixel RGB values into n_colors groups using k-means.
-    Returns (labels, centers) where labels is (N,) int32 and centers is (K, 3) float.
-    """
-    if len(pixels) < n_colors:
-        k = max(1, len(pixels))
-    else:
-        k = n_colors
-
-    if k < 2:
-        center = pixels[:1] if len(pixels) > 0 else np.zeros((1, 3), dtype=np.float32)
-        return np.zeros(len(pixels), dtype=np.int32), center
-
-    centers, labels = kmeans2(pixels, k, minit='++', iter=30)
-    return labels.astype(np.int32), centers
-
-
 def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
     """
     Compute how well the spatial color distribution matches between two images.
     Returns a score 0.0-1.0 where 1.0 means identical distribution (just colors swapped).
 
-    Downscales images first to smooth out gradients, then uses k-means to quantize,
-    Hungarian algorithm to find the best 1-to-1 color mapping based on spatial overlap,
-    and measures what fraction of pixels have matching mapped labels.
+    Downscales images first to smooth out gradients, then runs k-means ONCE on the
+    combined pixels of both images so that clustering is consistent. Uses Hungarian
+    algorithm to find the best 1-to-1 color mapping based on spatial overlap, then
+    measures what fraction of pixels have matching mapped labels.
     """
     h, w = old_arr.shape[:2]
 
     # Downscale to smooth out gradients and speed up clustering.
-    # Gradients (e.g. background shading) cause k-means to create unstable
-    # sub-clusters; downscaling averages them out while preserving block colors.
     SCALE = max(1, max(h, w) // 200)  # target ~200px on longest side
     small_h, small_w = max(1, h // SCALE), max(1, w // SCALE)
     old_small = np.array(Image.fromarray(old_arr).resize((small_w, small_h), Image.LANCZOS))
@@ -189,14 +170,24 @@ def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_si
     if len(old_pixels) == 0 or len(new_pixels) == 0:
         return 0.0
 
-    old_labels_valid, old_centers = _kmeans_quantize(old_pixels, n_colors)
-    new_labels_valid, new_centers = _kmeans_quantize(new_pixels, n_colors)
+    # Run k-means ONCE on combined pixels from both images.
+    # This ensures consistent cluster centers — identical images get identical
+    # labels, and color-swapped images get stable, comparable clusters.
+    combined = np.vstack([old_pixels, new_pixels])
+    k = min(n_colors, len(combined))
+    if k < 2:
+        return 1.0  # trivial case
 
-    k_old = len(old_centers)
-    k_new = len(new_centers)
+    centers, _ = kmeans2(combined, k, minit='++', iter=30)
+
+    # Assign both images to the same centers
+    old_labels_valid, _ = vq(old_pixels, centers)
+    new_labels_valid, _ = vq(new_pixels, centers)
+    old_labels_valid = old_labels_valid.astype(np.int32)
+    new_labels_valid = new_labels_valid.astype(np.int32)
 
     # Build overlap matrix: overlap[i][j] = pixels where old==i AND new==j
-    overlap = np.zeros((k_old, k_new), dtype=np.int64)
+    overlap = np.zeros((k, k), dtype=np.int64)
     np.add.at(overlap, (old_labels_valid, new_labels_valid), 1)
 
     # Hungarian algorithm (minimize cost = maximize overlap)
@@ -207,15 +198,8 @@ def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_si
     for r, c in zip(row_ind, col_ind):
         new_to_old[c] = r
 
-    # Handle unmatched new clusters (when k_new > k_old): nearest old center
-    matched_new = set(col_ind)
-    for j in range(k_new):
-        if j not in matched_new:
-            dists = np.linalg.norm(old_centers - new_centers[j], axis=1)
-            new_to_old[j] = int(np.argmin(dists))
-
     # Remap new labels to old label space and measure overlap
-    remap_table = np.full(k_new, -1, dtype=np.int32)
+    remap_table = np.arange(k, dtype=np.int32)  # default: identity
     for new_j, old_i in new_to_old.items():
         remap_table[new_j] = old_i
     remapped_new_labels = remap_table[new_labels_valid]

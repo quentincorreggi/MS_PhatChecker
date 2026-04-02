@@ -9,18 +9,6 @@ from scipy.cluster.vq import kmeans2, vq
 from scipy.optimize import linear_sum_assignment
 
 
-def _kmeans_quantize(pixels, n_colors):
-    if len(pixels) < n_colors:
-        k = max(1, len(pixels))
-    else:
-        k = n_colors
-    if k < 2:
-        center = pixels[:1] if len(pixels) > 0 else np.zeros((1, 3), dtype=np.float32)
-        return np.zeros(len(pixels), dtype=np.int32), center
-    centers, labels = kmeans2(pixels, k, minit='++', iter=30)
-    return labels.astype(np.int32), centers
-
-
 def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
     h, w = old_arr.shape[:2]
 
@@ -48,27 +36,36 @@ def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_si
     if len(old_pixels) == 0 or len(new_pixels) == 0:
         return 0.0
 
-    old_labels_valid, old_centers = _kmeans_quantize(old_pixels, n_colors)
-    new_labels_valid, new_centers = _kmeans_quantize(new_pixels, n_colors)
+    # Run k-means ONCE on combined pixels from both images.
+    # This ensures consistent cluster centers — identical images get identical
+    # labels, and color-swapped images get stable, comparable clusters.
+    combined = np.vstack([old_pixels, new_pixels])
+    k = min(n_colors, len(combined))
+    if k < 2:
+        return 1.0
 
-    k_old = len(old_centers)
-    k_new = len(new_centers)
+    centers, _ = kmeans2(combined, k, minit='++', iter=30)
 
-    overlap = np.zeros((k_old, k_new), dtype=np.int64)
+    # Assign both images to the same centers
+    old_labels_valid, _ = vq(old_pixels, centers)
+    new_labels_valid, _ = vq(new_pixels, centers)
+    old_labels_valid = old_labels_valid.astype(np.int32)
+    new_labels_valid = new_labels_valid.astype(np.int32)
+
+    # Build overlap matrix
+    overlap = np.zeros((k, k), dtype=np.int64)
     np.add.at(overlap, (old_labels_valid, new_labels_valid), 1)
 
+    # Hungarian algorithm (minimize cost = maximize overlap)
     row_ind, col_ind = linear_sum_assignment(-overlap)
 
+    # Build mapping: new_cluster -> old_cluster
     new_to_old = {}
     for r, c in zip(row_ind, col_ind):
         new_to_old[c] = r
-    matched_new = set(col_ind)
-    for j in range(k_new):
-        if j not in matched_new:
-            dists = np.linalg.norm(old_centers - new_centers[j], axis=1)
-            new_to_old[j] = int(np.argmin(dists))
 
-    remap_table = np.full(k_new, -1, dtype=np.int32)
+    # Remap new labels to old label space and measure overlap
+    remap_table = np.arange(k, dtype=np.int32)  # default: identity
     for new_j, old_i in new_to_old.items():
         remap_table[new_j] = old_i
     remapped_new_labels = remap_table[new_labels_valid]
