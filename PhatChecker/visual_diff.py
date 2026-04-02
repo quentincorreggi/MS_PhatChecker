@@ -153,18 +153,19 @@ def _kmeans_quantize(pixels, n_colors):
     else:
         sample = pixels
 
-    centers, _ = kmeans2(sample, k, minit='points', iter=20)
+    centers, _ = kmeans2(sample, k, minit='++', iter=30)
     labels, _ = vq(pixels, centers)
     return labels.astype(np.int32), centers
 
 
-def color_normalize(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
+def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
     """
-    Remap colors in new_arr to match old_arr based on spatial cluster overlap.
+    Compute how well the spatial color distribution matches between two images.
+    Returns a score 0.0-1.0 where 1.0 means identical distribution (just colors swapped).
 
-    Both images are quantized to n_colors dominant colors. Clusters are matched
-    between old and new using the Hungarian algorithm on spatial overlap.
-    Returns (old_quantized, remapped_new) for fair comparison.
+    Uses k-means to quantize both images, Hungarian algorithm to find the best
+    1-to-1 color mapping based on spatial overlap, then measures what fraction
+    of pixels have matching mapped labels.
     """
     h, w = old_arr.shape[:2]
 
@@ -184,19 +185,13 @@ def color_normalize(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
     new_pixels = new_arr[valid].reshape(-1, 3).astype(np.float32)
 
     if len(old_pixels) == 0 or len(new_pixels) == 0:
-        return old_arr.copy(), new_arr.copy()
+        return 0.0
 
     old_labels_valid, old_centers = _kmeans_quantize(old_pixels, n_colors)
     new_labels_valid, new_centers = _kmeans_quantize(new_pixels, n_colors)
 
     k_old = len(old_centers)
     k_new = len(new_centers)
-
-    # Build full label maps (-1 for masked pixels)
-    old_labels = np.full((h, w), -1, dtype=np.int32)
-    new_labels = np.full((h, w), -1, dtype=np.int32)
-    old_labels[valid] = old_labels_valid
-    new_labels[valid] = new_labels_valid
 
     # Build overlap matrix: overlap[i][j] = pixels where old==i AND new==j
     overlap = np.zeros((k_old, k_new), dtype=np.int64)
@@ -217,19 +212,18 @@ def color_normalize(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
             dists = np.linalg.norm(old_centers - new_centers[j], axis=1)
             new_to_old[j] = int(np.argmin(dists))
 
-    # Remap new image: each pixel gets the matched old cluster's color
-    remapped = new_arr.copy()
+    # Remap new labels to old label space and measure overlap
+    remap_table = np.full(k_new, -1, dtype=np.int32)
     for new_j, old_i in new_to_old.items():
-        pixel_mask = (new_labels == new_j)
-        remapped[pixel_mask] = old_centers[old_i].astype(np.uint8)
+        remap_table[new_j] = old_i
+    remapped_new_labels = remap_table[new_labels_valid]
 
-    # Quantize old image to its own centers for fair comparison
-    old_quantized = old_arr.copy()
-    for i in range(k_old):
-        pixel_mask = (old_labels == i)
-        old_quantized[pixel_mask] = old_centers[i].astype(np.uint8)
-
-    return old_quantized, remapped
+    # Match ratio = fraction of valid pixels where mapped labels agree
+    total_valid = len(old_labels_valid)
+    if total_valid == 0:
+        return 0.0
+    matching = np.sum(old_labels_valid == remapped_new_labels)
+    return float(matching / total_valid)
 
 
 # ---------------------------------------------------------------------------
@@ -346,13 +340,12 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
         new_arr = apply_shifts(new_arr, shifts, img_size)
         new_img = Image.fromarray(new_arr)
 
-    # Color-normalized comparison (detect color swaps)
+    # Color-swap detection: measure spatial distribution overlap
     color_swapped = False
     norm_score = None
     if color_normalize_k and color_normalize_k > 1:
-        old_norm, new_norm = color_normalize(old_arr, new_arr, n_colors=color_normalize_k,
-                                              masks=masks, image_size=img_size)
-        norm_score, _, _, _ = compute_diff(old_norm, new_norm, masks, img_size)
+        norm_score = compute_color_swap_score(old_arr, new_arr, n_colors=color_normalize_k,
+                                               masks=masks, image_size=img_size)
 
     score, ssim_map, pixel_diff, diff_mask = compute_diff(old_arr, new_arr, masks, img_size)
     changed_pixels = int(np.sum(diff_mask))
@@ -360,9 +353,9 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
     change_pct = (changed_pixels / total_pixels) * 100
     passed = score >= threshold
 
-    # If normal comparison fails but color-normalized passes, it's a color swap
+    # If normal SSIM fails but color distribution matches (>90%), it's a color swap
     if color_normalize_k and color_normalize_k > 1 and not passed:
-        if norm_score is not None and norm_score >= threshold:
+        if norm_score is not None and norm_score >= 0.90:
             passed = True
             color_swapped = True
 
@@ -613,7 +606,7 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     rows_swapped = ""
     for r in swapped:
         imgs = r["images"]
-        norm_info = f"  Normalized SSIM: {r['norm_score']:.6f}" if r.get('norm_score') is not None else ""
+        norm_info = f"  Distribution match: {r['norm_score']:.1%}" if r.get('norm_score') is not None else ""
         rows_swapped += f'''
         <div class="level-card swap" onclick="this.classList.toggle('expanded')">
             <div class="card-header">
