@@ -139,22 +139,16 @@ def _kmeans_quantize(pixels, n_colors):
     Cluster pixel RGB values into n_colors groups using k-means.
     Returns (labels, centers) where labels is (N,) int32 and centers is (K, 3) float.
     """
-    unique_colors = np.unique(pixels, axis=0)
-    k = min(n_colors, len(unique_colors))
+    if len(pixels) < n_colors:
+        k = max(1, len(pixels))
+    else:
+        k = n_colors
 
     if k < 2:
-        return np.zeros(len(pixels), dtype=np.int32), unique_colors[:1] if len(unique_colors) > 0 else np.zeros((1, 3), dtype=np.float32)
+        center = pixels[:1] if len(pixels) > 0 else np.zeros((1, 3), dtype=np.float32)
+        return np.zeros(len(pixels), dtype=np.int32), center
 
-    # Subsample for speed on large images
-    MAX_SAMPLES = 500_000
-    if len(pixels) > MAX_SAMPLES:
-        idx = np.random.default_rng(42).choice(len(pixels), MAX_SAMPLES, replace=False)
-        sample = pixels[idx]
-    else:
-        sample = pixels
-
-    centers, _ = kmeans2(sample, k, minit='++', iter=30)
-    labels, _ = vq(pixels, centers)
+    centers, labels = kmeans2(pixels, k, minit='++', iter=30)
     return labels.astype(np.int32), centers
 
 
@@ -163,26 +157,34 @@ def compute_color_swap_score(old_arr, new_arr, n_colors=16, masks=None, image_si
     Compute how well the spatial color distribution matches between two images.
     Returns a score 0.0-1.0 where 1.0 means identical distribution (just colors swapped).
 
-    Uses k-means to quantize both images, Hungarian algorithm to find the best
-    1-to-1 color mapping based on spatial overlap, then measures what fraction
-    of pixels have matching mapped labels.
+    Downscales images first to smooth out gradients, then uses k-means to quantize,
+    Hungarian algorithm to find the best 1-to-1 color mapping based on spatial overlap,
+    and measures what fraction of pixels have matching mapped labels.
     """
     h, w = old_arr.shape[:2]
 
-    # Build valid-pixel mask (exclude masked regions from clustering)
-    valid = np.ones((h, w), dtype=bool)
+    # Downscale to smooth out gradients and speed up clustering.
+    # Gradients (e.g. background shading) cause k-means to create unstable
+    # sub-clusters; downscaling averages them out while preserving block colors.
+    SCALE = max(1, max(h, w) // 200)  # target ~200px on longest side
+    small_h, small_w = max(1, h // SCALE), max(1, w // SCALE)
+    old_small = np.array(Image.fromarray(old_arr).resize((small_w, small_h), Image.LANCZOS))
+    new_small = np.array(Image.fromarray(new_arr).resize((small_w, small_h), Image.LANCZOS))
+
+    # Build valid-pixel mask on the small image
+    valid = np.ones((small_h, small_w), dtype=bool)
     if masks and image_size:
-        sx = w / image_size[0] if image_size[0] else 1
-        sy = h / image_size[1] if image_size[1] else 1
+        sx = small_w / image_size[0] if image_size[0] else 1
+        sy = small_h / image_size[1] if image_size[1] else 1
         for m in masks:
             x1 = max(0, int(m["x"] * sx))
             y1 = max(0, int(m["y"] * sy))
-            x2 = min(w, int((m["x"] + m["width"]) * sx))
-            y2 = min(h, int((m["y"] + m["height"]) * sy))
+            x2 = min(small_w, int((m["x"] + m["width"]) * sx))
+            y2 = min(small_h, int((m["y"] + m["height"]) * sy))
             valid[y1:y2, x1:x2] = False
 
-    old_pixels = old_arr[valid].reshape(-1, 3).astype(np.float32)
-    new_pixels = new_arr[valid].reshape(-1, 3).astype(np.float32)
+    old_pixels = old_small[valid].reshape(-1, 3).astype(np.float32)
+    new_pixels = new_small[valid].reshape(-1, 3).astype(np.float32)
 
     if len(old_pixels) == 0 or len(new_pixels) == 0:
         return 0.0
