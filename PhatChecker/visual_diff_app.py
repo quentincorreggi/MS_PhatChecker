@@ -84,6 +84,7 @@ def run_diff():
     threshold = float(data.get("threshold", 0.995))
     workers = int(data.get("workers", 4))
     save_pass = data.get("savePass", False)
+    color_normalize_k = int(data.get("colorNormalizeK", 0))
     masks = data.get("masks", [])
     shifts = data.get("shifts", [])
     mask_image_size = data.get("maskImageSize", None)
@@ -106,22 +107,25 @@ def run_diff():
 
             results, only_old, only_new = run_batch(
                 old_dir, new_dir, output_dir, threshold, workers, save_pass,
-                mask_list, msize, shift_list
+                mask_list, msize, shift_list, color_normalize_k
             )
 
             report_path = generate_html_report(results, only_old, only_new, output_dir, threshold)
 
             failed = [r for r in results if not r["passed"]]
-            passed_list = [r for r in results if r["passed"]]
+            swapped_list = [r for r in results if r["passed"] and r.get("color_swapped")]
+            passed_list = [r for r in results if r["passed"] and not r.get("color_swapped")]
 
+            swap_msg = f", {len(swapped_list)} color swaps" if swapped_list else ""
             current_job = {
                 "status": "done",
                 "progress": len(results),
                 "total": len(results),
-                "message": f"Done! {len(passed_list)} passed, {len(failed)} failed",
+                "message": f"Done! {len(passed_list)} passed{swap_msg}, {len(failed)} failed",
                 "results": {
                     "total": len(results),
                     "passed": len(passed_list),
+                    "swapped": len(swapped_list),
                     "failed": len(failed),
                     "missing_old": len(only_old),
                     "missing_new": len(only_new),
@@ -130,6 +134,7 @@ def run_diff():
                     "levels": [
                         {"level": r["level"], "score": float(r["score"]),
                          "passed": bool(r["passed"]),
+                         "color_swapped": bool(r.get("color_swapped", False)),
                          "change_pct": float(r["change_pct"])}
                         for r in results
                     ],
@@ -268,6 +273,7 @@ input::placeholder { color: #555; }
 .result-stat .num { font-size: 32px; font-weight: 700; }
 .result-stat .lbl { font-size: 12px; color: var(--text2); margin-top: 2px; }
 .result-stat.pass .num { color: var(--green); }
+.result-stat.swap .num { color: var(--orange); }
 .result-stat.fail .num { color: var(--red); }
 .result-stat.total .num { color: var(--accent2); }
 
@@ -362,6 +368,20 @@ input::placeholder { color: #555; }
                 <input type="checkbox" id="save-pass">
                 Save diff images for passed levels too (uses more disk space)
             </label>
+        </div>
+        <div class="form-group">
+            <label class="checkbox-group">
+                <input type="checkbox" id="color-normalize" onchange="toggleColorK()">
+                Color-invariant mode (detect color swaps without false positives)
+            </label>
+        </div>
+        <div class="form-group" id="color-k-group" style="display:none">
+            <label>Number of color clusters (K)</label>
+            <div class="range-group">
+                <input type="range" id="color-k" min="4" max="32" step="1" value="16"
+                       oninput="document.getElementById('color-k-val').textContent = this.value">
+                <span class="range-value" id="color-k-val">16</span>
+            </div>
         </div>
     </div>
 
@@ -483,6 +503,11 @@ function showTab(name) {
 // ===== Folder browser =====
 let browserTarget = null;
 let browserCurrentPath = '';
+
+function toggleColorK() {
+    const checked = document.getElementById('color-normalize').checked;
+    document.getElementById('color-k-group').style.display = checked ? '' : 'none';
+}
 
 function openBrowser(inputId) {
     browserTarget = inputId;
@@ -790,6 +815,8 @@ async function runComparison() {
         threshold: parseFloat(document.getElementById('threshold').value),
         workers: parseInt(document.getElementById('workers').value),
         savePass: document.getElementById('save-pass').checked,
+        colorNormalizeK: document.getElementById('color-normalize').checked
+                         ? parseInt(document.getElementById('color-k').value) : 0,
         masks: masks.length > 0 ? masks : [],
         shifts: shifts.length > 0 ? shifts : [],
         maskImageSize: hasRegions ? [maskImgNatW, maskImgNatH] : null,
@@ -847,10 +874,12 @@ function showResults(results) {
     const container = document.getElementById('results-content');
     container.style.display = '';
 
+    const swapCard = results.swapped ? `<div class="result-stat swap"><div class="num">${results.swapped}</div><div class="lbl">Color Swaps</div></div>` : '';
     let html = `
         <div class="results-summary">
             <div class="result-stat total"><div class="num">${results.total}</div><div class="lbl">Total</div></div>
             <div class="result-stat pass"><div class="num">${results.passed}</div><div class="lbl">Passed</div></div>
+            ${swapCard}
             <div class="result-stat fail"><div class="num">${results.failed}</div><div class="lbl">Failed</div></div>
         </div>
     `;
@@ -865,6 +894,7 @@ function showResults(results) {
 
     if (results.levels) {
         const failed = results.levels.filter(l => !l.passed);
+        const swappedLevels = results.levels.filter(l => l.passed && l.color_swapped);
         if (failed.length > 0) {
             html += '<div class="card"><h3>Failed Levels</h3>';
             failed.forEach(l => {
@@ -876,6 +906,22 @@ function showResults(results) {
                     <span style="color:var(--orange);font-size:13px;">${l.change_pct}% changed</span>
                     <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;max-width:200px;">
                         <div style="height:100%;width:${pct}%;background:var(--red);border-radius:3px;"></div>
+                    </div>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        if (swappedLevels.length > 0) {
+            html += '<div class="card"><h3>Color Swaps (distribution unchanged)</h3>';
+            swappedLevels.forEach(l => {
+                const pct = (l.score * 100).toFixed(2);
+                html += `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border);">
+                    <span style="color:var(--orange);font-weight:700;font-size:12px;">SWAP</span>
+                    <span style="font-weight:600;min-width:120px;">${l.level}</span>
+                    <span style="color:var(--text2);font-family:monospace;font-size:13px;">SSIM: ${l.score.toFixed(6)}</span>
+                    <span style="color:var(--orange);font-size:13px;">${l.change_pct}% changed</span>
+                    <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;max-width:200px;">
+                        <div style="height:100%;width:${pct}%;background:var(--orange);border-radius:3px;"></div>
                     </div>
                 </div>`;
             });

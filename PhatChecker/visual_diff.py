@@ -25,6 +25,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from PIL import Image, ImageDraw
 from skimage.metrics import structural_similarity as ssim
+from scipy.cluster.vq import kmeans2, vq
+from scipy.optimize import linear_sum_assignment
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +131,108 @@ def create_mask_overlay(img, masks, image_size):
 
 
 # ---------------------------------------------------------------------------
+# Color normalization (color-invariant comparison)
+# ---------------------------------------------------------------------------
+
+def _kmeans_quantize(pixels, n_colors):
+    """
+    Cluster pixel RGB values into n_colors groups using k-means.
+    Returns (labels, centers) where labels is (N,) int32 and centers is (K, 3) float.
+    """
+    unique_colors = np.unique(pixels, axis=0)
+    k = min(n_colors, len(unique_colors))
+
+    if k < 2:
+        return np.zeros(len(pixels), dtype=np.int32), unique_colors[:1] if len(unique_colors) > 0 else np.zeros((1, 3), dtype=np.float32)
+
+    # Subsample for speed on large images
+    MAX_SAMPLES = 500_000
+    if len(pixels) > MAX_SAMPLES:
+        idx = np.random.default_rng(42).choice(len(pixels), MAX_SAMPLES, replace=False)
+        sample = pixels[idx]
+    else:
+        sample = pixels
+
+    centers, _ = kmeans2(sample, k, minit='points', iter=20)
+    labels, _ = vq(pixels, centers)
+    return labels.astype(np.int32), centers
+
+
+def color_normalize(old_arr, new_arr, n_colors=16, masks=None, image_size=None):
+    """
+    Remap colors in new_arr to match old_arr based on spatial cluster overlap.
+
+    Both images are quantized to n_colors dominant colors. Clusters are matched
+    between old and new using the Hungarian algorithm on spatial overlap.
+    Returns (old_quantized, remapped_new) for fair comparison.
+    """
+    h, w = old_arr.shape[:2]
+
+    # Build valid-pixel mask (exclude masked regions from clustering)
+    valid = np.ones((h, w), dtype=bool)
+    if masks and image_size:
+        sx = w / image_size[0] if image_size[0] else 1
+        sy = h / image_size[1] if image_size[1] else 1
+        for m in masks:
+            x1 = max(0, int(m["x"] * sx))
+            y1 = max(0, int(m["y"] * sy))
+            x2 = min(w, int((m["x"] + m["width"]) * sx))
+            y2 = min(h, int((m["y"] + m["height"]) * sy))
+            valid[y1:y2, x1:x2] = False
+
+    old_pixels = old_arr[valid].reshape(-1, 3).astype(np.float32)
+    new_pixels = new_arr[valid].reshape(-1, 3).astype(np.float32)
+
+    if len(old_pixels) == 0 or len(new_pixels) == 0:
+        return old_arr.copy(), new_arr.copy()
+
+    old_labels_valid, old_centers = _kmeans_quantize(old_pixels, n_colors)
+    new_labels_valid, new_centers = _kmeans_quantize(new_pixels, n_colors)
+
+    k_old = len(old_centers)
+    k_new = len(new_centers)
+
+    # Build full label maps (-1 for masked pixels)
+    old_labels = np.full((h, w), -1, dtype=np.int32)
+    new_labels = np.full((h, w), -1, dtype=np.int32)
+    old_labels[valid] = old_labels_valid
+    new_labels[valid] = new_labels_valid
+
+    # Build overlap matrix: overlap[i][j] = pixels where old==i AND new==j
+    overlap = np.zeros((k_old, k_new), dtype=np.int64)
+    np.add.at(overlap, (old_labels_valid, new_labels_valid), 1)
+
+    # Hungarian algorithm (minimize cost = maximize overlap)
+    row_ind, col_ind = linear_sum_assignment(-overlap)
+
+    # Build mapping: new_cluster -> old_cluster
+    new_to_old = {}
+    for r, c in zip(row_ind, col_ind):
+        new_to_old[c] = r
+
+    # Handle unmatched new clusters (when k_new > k_old): nearest old center
+    matched_new = set(col_ind)
+    for j in range(k_new):
+        if j not in matched_new:
+            dists = np.linalg.norm(old_centers - new_centers[j], axis=1)
+            new_to_old[j] = int(np.argmin(dists))
+
+    # Remap new image: each pixel gets the matched old cluster's color
+    remapped = new_arr.copy()
+    for new_j, old_i in new_to_old.items():
+        pixel_mask = (new_labels == new_j)
+        remapped[pixel_mask] = old_centers[old_i].astype(np.uint8)
+
+    # Quantize old image to its own centers for fair comparison
+    old_quantized = old_arr.copy()
+    for i in range(k_old):
+        pixel_mask = (old_labels == i)
+        old_quantized[pixel_mask] = old_centers[i].astype(np.uint8)
+
+    return old_quantized, remapped
+
+
+# ---------------------------------------------------------------------------
 # Core comparison functions
 # ---------------------------------------------------------------------------
 
@@ -202,7 +306,7 @@ def create_amplified_diff(pixel_diff):
 # ---------------------------------------------------------------------------
 
 def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=False,
-                   masks=None, mask_image_size=None, shifts=None):
+                   masks=None, mask_image_size=None, shifts=None, color_normalize_k=0):
     """
     Compare one pair. Returns a result dict.
     Only generates diff images for FAILed levels (unless save_pass=True).
@@ -223,6 +327,8 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
             "passed": False,
             "changed_pixels": 0,
             "change_pct": 0,
+            "color_swapped": False,
+            "norm_score": None,
             "images": {},
         }
 
@@ -240,11 +346,25 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
         new_arr = apply_shifts(new_arr, shifts, img_size)
         new_img = Image.fromarray(new_arr)
 
+    # Color-normalized comparison (detect color swaps)
+    color_swapped = False
+    norm_score = None
+    if color_normalize_k and color_normalize_k > 1:
+        old_norm, new_norm = color_normalize(old_arr, new_arr, n_colors=color_normalize_k,
+                                              masks=masks, image_size=img_size)
+        norm_score, _, _, _ = compute_diff(old_norm, new_norm, masks, img_size)
+
     score, ssim_map, pixel_diff, diff_mask = compute_diff(old_arr, new_arr, masks, img_size)
     changed_pixels = int(np.sum(diff_mask))
     total_pixels = int(diff_mask.size)
     change_pct = (changed_pixels / total_pixels) * 100
     passed = score >= threshold
+
+    # If normal comparison fails but color-normalized passes, it's a color swap
+    if color_normalize_k and color_normalize_k > 1 and not passed:
+        if norm_score is not None and norm_score >= threshold:
+            passed = True
+            color_swapped = True
 
     images = {}
 
@@ -294,6 +414,8 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
         "changed_pixels": changed_pixels,
         "change_pct": round(change_pct, 3),
         "size_warning": size_warning,
+        "color_swapped": color_swapped,
+        "norm_score": float(norm_score) if norm_score is not None else None,
         "error": None,
         "images": images,
     }
@@ -371,7 +493,7 @@ def find_pairs(old_dir, new_dir):
 
 
 def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pass=False,
-              masks=None, mask_image_size=None, shifts=None):
+              masks=None, mask_image_size=None, shifts=None, color_normalize_k=0):
     """Process all matched pairs, return list of results."""
     pairs, only_old, only_new = find_pairs(old_dir, new_dir)
 
@@ -389,6 +511,8 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
         print(f"  Using {len(masks)} mask region(s)")
     if shifts:
         print(f"  Using {len(shifts)} shift correction(s)")
+    if color_normalize_k:
+        print(f"  Color normalization: ON (K={color_normalize_k})")
     if only_old:
         print(f"  Warning: {len(only_old)} files only in old dir (missing from new)")
     if only_new:
@@ -396,7 +520,7 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
     print()
 
     tasks = [
-        (old_p, new_p, diff_dir, threshold, save_pass, masks, mask_image_size, shifts)
+        (old_p, new_p, diff_dir, threshold, save_pass, masks, mask_image_size, shifts, color_normalize_k)
         for old_p, new_p in pairs
     ]
     results = []
@@ -408,7 +532,7 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
         for future in as_completed(futures):
             done_count += 1
             result = future.result()
-            status = "PASS" if result["passed"] else "FAIL"
+            status = "SWAP" if result.get("color_swapped") else ("PASS" if result["passed"] else "FAIL")
             print(f"  [{done_count:>4}/{len(pairs)}] {status}  SSIM={result['score']:.4f}  {result['level']}")
             results.append(result)
 
@@ -428,7 +552,8 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     """Generate an interactive HTML report."""
     total = len(results)
     failed = [r for r in results if not r["passed"]]
-    passed = [r for r in results if r["passed"]]
+    swapped = [r for r in results if r["passed"] and r.get("color_swapped")]
+    passed = [r for r in results if r["passed"] and not r.get("color_swapped")]
 
     report_path = os.path.join(output_dir, "report.html")
 
@@ -482,6 +607,34 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
                 </div>
                 {f'<div class="warning">{r["size_warning"]}</div>' if r.get("size_warning") else ""}
                 {f'<div class="error">Error: {r["error"]}</div>' if r.get("error") else ""}
+            </div>
+        </div>'''
+
+    rows_swapped = ""
+    for r in swapped:
+        imgs = r["images"]
+        norm_info = f"  Normalized SSIM: {r['norm_score']:.6f}" if r.get('norm_score') is not None else ""
+        rows_swapped += f'''
+        <div class="level-card swap" onclick="this.classList.toggle('expanded')">
+            <div class="card-header">
+                <span class="status-badge swap">SWAP</span>
+                <span class="level-name">{r['level']}</span>
+                <span class="score">SSIM: {r['score']:.6f}{norm_info}</span>
+                <span class="change-pct" style="color:#ff9800">{r['change_pct']:.2f}% changed</span>
+                {score_bar(r['score'], threshold)}
+            </div>
+            <div class="card-details">
+                <div style="color:#ff9800;font-size:13px;margin-bottom:12px;">Colors changed but distribution matches (color-invariant check passed)</div>
+                <div class="thumbs">
+                    <div class="thumb-col">
+                        <div class="thumb-label">Old</div>
+                        {img_tag(imgs.get('thumb_old'), 'old')}
+                    </div>
+                    <div class="thumb-col">
+                        <div class="thumb-label">New</div>
+                        {img_tag(imgs.get('thumb_new'), 'new')}
+                    </div>
+                </div>
             </div>
         </div>'''
 
@@ -542,12 +695,17 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     .level-card {{ background: #16213e; border-radius: 10px; margin-bottom: 8px; overflow: hidden; }}
     .level-card.fail {{ border-left: 4px solid #f44336; }}
     .level-card.pass {{ border-left: 4px solid #4caf50; }}
+    .level-card.swap {{ border-left: 4px solid #ff9800; }}
     .level-card.fail .card-header {{ cursor: pointer; }}
     .level-card.fail .card-header:hover {{ background: #1a2744; }}
+    .level-card.swap .card-header {{ cursor: pointer; }}
+    .level-card.swap .card-header:hover {{ background: #1a2744; }}
     .card-header {{ display: flex; align-items: center; gap: 12px; padding: 12px 16px; flex-wrap: wrap; }}
     .status-badge {{ font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 4px; }}
     .status-badge.fail {{ background: #f4433622; color: #f44336; }}
     .status-badge.pass {{ background: #4caf5022; color: #4caf50; }}
+    .status-badge.swap {{ background: #ff980022; color: #ff9800; }}
+    .summary-card.swap .number {{ color: #ff9800; }}
     .level-name {{ font-weight: 600; min-width: 120px; }}
     .score {{ color: #888; font-size: 13px; font-family: monospace; }}
     .change-pct {{ color: #ff9800; font-size: 13px; }}
@@ -583,6 +741,7 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
 <div class="summary">
     <div class="summary-card total"><div class="number">{total}</div><div class="label">Total Levels</div></div>
     <div class="summary-card fail"><div class="number">{len(failed)}</div><div class="label">Failed</div></div>
+    <div class="summary-card swap"><div class="number">{len(swapped)}</div><div class="label">Color Swaps</div></div>
     <div class="summary-card pass"><div class="number">{len(passed)}</div><div class="label">Passed</div></div>
     <div class="summary-card warn"><div class="number">{len(only_old) + len(only_new)}</div><div class="label">Missing</div></div>
 </div>
@@ -590,12 +749,15 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     <input type="text" id="search" placeholder="Search levels..." oninput="filterLevels()">
     <button class="filter-btn active" onclick="setFilter('all', this)">All</button>
     <button class="filter-btn" onclick="setFilter('fail', this)">Failures only</button>
+    <button class="filter-btn" onclick="setFilter('swap', this)">Color swaps</button>
     <button class="filter-btn" onclick="setFilter('pass', this)">Passed only</button>
 </div>
 {missing_html}
 <div class="section" id="results-section">
     <h2>Failed ({len(failed)})</h2>
     <div id="failed-list">{rows_failed}</div>
+    <h2 style="margin-top:30px">Color Swaps ({len(swapped)})</h2>
+    <div id="swap-list">{rows_swapped}</div>
     <h2 style="margin-top:30px">Passed ({len(passed)})</h2>
     <div id="passed-list">{rows_passed}</div>
 </div>
@@ -623,7 +785,12 @@ function filterLevels() {{
         const name = card.querySelector('.level-name')?.textContent.toLowerCase() || '';
         const matchesSearch = !query || name.includes(query);
         const isFail = card.classList.contains('fail');
-        const matchesFilter = currentFilter === 'all' || (currentFilter === 'fail' && isFail) || (currentFilter === 'pass' && !isFail);
+        const isSwap = card.classList.contains('swap');
+        const isPass = card.classList.contains('pass');
+        const matchesFilter = currentFilter === 'all'
+            || (currentFilter === 'fail' && isFail)
+            || (currentFilter === 'swap' && isSwap)
+            || (currentFilter === 'pass' && isPass);
         card.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
     }});
 }}
@@ -663,6 +830,10 @@ Examples:
                         help="Number of parallel workers (default: 4)")
     parser.add_argument("--save-pass", action="store_true",
                         help="Also save diff images for passed levels")
+    parser.add_argument("--color-normalize", type=int, default=0, metavar="K",
+                        help="Enable color-invariant comparison with K color clusters "
+                             "(e.g. --color-normalize 16). Detects color swaps without "
+                             "false positives. 0 = disabled (default).")
     parser.add_argument("--mask", "-m", default=None,
                         help="Path to mask config JSON (from the web UI)")
     args = parser.parse_args()
@@ -684,9 +855,12 @@ Examples:
             sys.exit(1)
         result = run_comparison(args.old, args.new, args.output_dir, args.threshold,
                                 save_pass=True, masks=masks, mask_image_size=mask_image_size,
-                                shifts=shifts)
-        status = "PASS" if result["passed"] else "FAIL"
-        print(f"\n{status}  SSIM: {result['score']:.6f}  Changed: {result['change_pct']:.2f}%")
+                                shifts=shifts, color_normalize_k=args.color_normalize)
+        status = "SWAP" if result.get("color_swapped") else ("PASS" if result["passed"] else "FAIL")
+        extra = ""
+        if result.get("norm_score") is not None:
+            extra = f"  Norm-SSIM: {result['norm_score']:.6f}"
+        print(f"\n{status}  SSIM: {result['score']:.6f}{extra}  Changed: {result['change_pct']:.2f}%")
     else:
         if not os.path.isdir(args.old):
             print(f"Error: Not a directory: {args.old}")
@@ -697,14 +871,16 @@ Examples:
 
         results, only_old, only_new = run_batch(
             args.old, args.new, args.output_dir, args.threshold, args.workers, args.save_pass,
-            masks, mask_image_size, shifts
+            masks, mask_image_size, shifts, args.color_normalize
         )
 
         failed = [r for r in results if not r["passed"]]
-        passed = [r for r in results if r["passed"]]
+        swapped = [r for r in results if r["passed"] and r.get("color_swapped")]
+        passed = [r for r in results if r["passed"] and not r.get("color_swapped")]
 
         print(f"\n{'='*60}")
-        print(f"  Total: {len(results)}  |  Passed: {len(passed)}  |  Failed: {len(failed)}")
+        swap_info = f"  |  Color Swaps: {len(swapped)}" if swapped else ""
+        print(f"  Total: {len(results)}  |  Passed: {len(passed)}{swap_info}  |  Failed: {len(failed)}")
         if only_old:
             print(f"  Missing from new: {len(only_old)}")
         if only_new:
