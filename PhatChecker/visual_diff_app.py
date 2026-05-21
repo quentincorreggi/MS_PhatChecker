@@ -192,7 +192,7 @@ def save_mask():
         "imageWidth": data.get("imageWidth", 0),
         "imageHeight": data.get("imageHeight", 0),
     }
-    with open(save_path, "w") as f:
+    with open(save_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     return jsonify({"saved": save_path})
 
@@ -212,7 +212,7 @@ def save_grid():
         "minK": data.get("minK", 2),
         "maxK": data.get("maxK", 8),
     }
-    with open(save_path, "w") as f:
+    with open(save_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     return jsonify({"saved": save_path})
 
@@ -224,7 +224,7 @@ def load_grid():
     path = data.get("path", "")
     if not path or not os.path.exists(path):
         return jsonify({"error": "File not found"}), 404
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return jsonify(json.load(f))
 
 

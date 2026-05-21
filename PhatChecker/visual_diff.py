@@ -777,7 +777,7 @@ function filterLevels() {{
 </body>
 </html>'''
 
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)
     return report_path
 
@@ -828,7 +828,7 @@ Examples:
         if not os.path.exists(args.grid_config):
             print(f"Error: grid config not found: {args.grid_config}")
             sys.exit(1)
-        with open(args.grid_config, "r") as f:
+        with open(args.grid_config, "r", encoding="utf-8") as f:
             grid_config_dict = json.load(f)
 
     if args.single:

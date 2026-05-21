@@ -125,12 +125,12 @@ class GridConfig:
 def load_grid_config(path: str) -> Optional[GridConfig]:
     if not path or not os.path.exists(path):
         return None
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return GridConfig.from_dict(json.load(f))
 
 
 def save_grid_config(path: str, config: GridConfig) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(config.to_dict(), f, indent=2)
 
 
