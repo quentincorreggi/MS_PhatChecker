@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from visual_diff import (
     run_batch, run_comparison, generate_html_report, load_mask_config
 )
+import color_pattern
 
 app = Flask(__name__)
 
@@ -73,6 +74,28 @@ def sample_image():
     return jsonify({"error": "No PNG files found"}), 404
 
 
+@app.route("/api/sample-image-path", methods=["POST"])
+def sample_image_path():
+    """Like /api/sample-image but returns the server-side path (used for preview)."""
+    data = request.json
+    path = data.get("path", "")
+    if not os.path.isdir(path):
+        return jsonify({"error": "Not a directory"}), 400
+    for f in sorted(os.listdir(path)):
+        if f.lower().endswith(".png"):
+            return jsonify({"path": os.path.join(path, f)})
+    return jsonify({"error": "No PNG files found"}), 404
+
+
+@app.route("/api/serve-image")
+def serve_image():
+    """Serve an arbitrary local PNG (used by Grid Editor to display the sample)."""
+    path = request.args.get("path", "")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    return send_file(path, mimetype="image/png")
+
+
 @app.route("/api/run", methods=["POST"])
 def run_diff():
     """Start a batch comparison."""
@@ -87,6 +110,7 @@ def run_diff():
     masks = data.get("masks", [])
     shifts = data.get("shifts", [])
     mask_image_size = data.get("maskImageSize", None)
+    grid_config = data.get("gridConfig", None)
     output_dir = data.get("outputDir", "") or os.path.join(old_dir, "..", "regression_report")
     output_dir = os.path.abspath(output_dir)
 
@@ -103,26 +127,31 @@ def run_diff():
             mask_list = masks if masks else None
             shift_list = shifts if shifts else None
             msize = tuple(mask_image_size) if mask_image_size else None
+            gc = grid_config if grid_config and grid_config.get("grids") else None
 
             results, only_old, only_new = run_batch(
                 old_dir, new_dir, output_dir, threshold, workers, save_pass,
-                mask_list, msize, shift_list
+                mask_list, msize, shift_list, gc
             )
 
             report_path = generate_html_report(results, only_old, only_new, output_dir, threshold)
 
             failed = [r for r in results if not r["passed"]]
             passed_list = [r for r in results if r["passed"]]
+            pattern_failed = [r for r in results if r.get("pattern") and not r["pattern"]["passed"]]
 
             current_job = {
                 "status": "done",
                 "progress": len(results),
                 "total": len(results),
-                "message": f"Done! {len(passed_list)} passed, {len(failed)} failed",
+                "message": f"Done! {len(passed_list)} passed, {len(failed)} failed"
+                           + (f", {len(pattern_failed)} pattern-fail" if gc else ""),
                 "results": {
                     "total": len(results),
                     "passed": len(passed_list),
                     "failed": len(failed),
+                    "pattern_enabled": bool(gc),
+                    "pattern_failed": len(pattern_failed),
                     "missing_old": len(only_old),
                     "missing_new": len(only_new),
                     "report_path": report_path,
@@ -130,7 +159,11 @@ def run_diff():
                     "levels": [
                         {"level": r["level"], "score": float(r["score"]),
                          "passed": bool(r["passed"]),
-                         "change_pct": float(r["change_pct"])}
+                         "change_pct": float(r["change_pct"]),
+                         "pattern_passed": (None if not r.get("pattern")
+                                            else bool(r["pattern"]["passed"])),
+                         "pattern_mismatches": (0 if not r.get("pattern")
+                                                else int(r["pattern"]["mismatches"]))}
                         for r in results
                     ],
                 },
@@ -162,6 +195,61 @@ def save_mask():
     with open(save_path, "w") as f:
         json.dump(config, f, indent=2)
     return jsonify({"saved": save_path})
+
+
+@app.route("/api/save-grid", methods=["POST"])
+def save_grid():
+    """Save grid config (color pattern calibration) to a JSON file."""
+    data = request.json
+    save_path = data.get("path", "grid_config.json")
+    config = {
+        "imageWidth": data.get("imageWidth", 0),
+        "imageHeight": data.get("imageHeight", 0),
+        "grids": data.get("grids", []),
+        "cellInsetPct": data.get("cellInsetPct", 0.20),
+        "satThreshold": data.get("satThreshold", 0.25),
+        "emptyCoveragePct": data.get("emptyCoveragePct", 0.08),
+        "minK": data.get("minK", 2),
+        "maxK": data.get("maxK", 8),
+    }
+    with open(save_path, "w") as f:
+        json.dump(config, f, indent=2)
+    return jsonify({"saved": save_path})
+
+
+@app.route("/api/load-grid", methods=["POST"])
+def load_grid():
+    """Load a saved grid config (so the user can re-edit it)."""
+    data = request.json
+    path = data.get("path", "")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "File not found"}), 404
+    with open(path, "r") as f:
+        return jsonify(json.load(f))
+
+
+@app.route("/api/preview-pattern", methods=["POST"])
+def preview_pattern():
+    """Run pattern analysis on a single image and return the label grids.
+    Used by the Grid Editor to preview the clustering result.
+    """
+    data = request.json
+    img_path = data.get("imagePath")
+    config_dict = data.get("gridConfig")
+    if not img_path or not os.path.exists(img_path):
+        return jsonify({"error": "Image not found"}), 400
+    if not config_dict or not config_dict.get("grids"):
+        return jsonify({"error": "Grid config required"}), 400
+    try:
+        config = color_pattern.GridConfig.from_dict(config_dict)
+        pattern = color_pattern.analyze(img_path, config)
+        return jsonify({
+            "grids": pattern.grids,
+            "palette": pattern.palette,
+            "k": pattern.k,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/report/<path:filepath>")
@@ -276,6 +364,10 @@ input::placeholder { color: #555; }
 .status-msg.done { background: #1b5e2022; border: 1px solid var(--green); color: var(--green); }
 .status-msg.error { background: #b7121222; border: 1px solid var(--red); color: var(--red); }
 
+.filter-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.filter-btn:hover { border-color: var(--accent); }
+.filter-btn.active { background: #0f3460; border-color: var(--accent2); color: var(--accent2); }
+
 /* Folder browser modal */
 .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; align-items: center; justify-content: center; }
 .modal-overlay.active { display: flex; }
@@ -304,6 +396,7 @@ input::placeholder { color: #555; }
     <div class="tabs">
         <button class="tab active" onclick="showTab('setup')">Setup</button>
         <button class="tab" onclick="showTab('masks')">Mask Editor</button>
+        <button class="tab" onclick="showTab('grids')">Grid Editor</button>
         <button class="tab" onclick="showTab('results')">Results</button>
     </div>
 </div>
@@ -333,6 +426,13 @@ input::placeholder { color: #555; }
             <div style="display:flex;gap:8px">
                 <input type="text" id="output-dir" placeholder="Leave empty for auto (next to old folder)">
                 <button class="btn btn-secondary btn-sm" onclick="openBrowser('output-dir')">Browse</button>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Grid Config (optional — enables color-agnostic pattern check)</label>
+            <div style="display:flex;gap:8px">
+                <input type="text" id="grid-config-path" placeholder="Leave empty to skip pattern check, or path to grid_config.json">
+                <button class="btn btn-secondary btn-sm" onclick="showTab('grids')">Edit</button>
             </div>
         </div>
     </div>
@@ -368,6 +468,15 @@ input::placeholder { color: #555; }
     <div class="card" id="mask-summary" style="display:none">
         <h3>Active Masks</h3>
         <p id="mask-count-summary" style="color:var(--accent2);font-size:14px;"></p>
+    </div>
+
+    <div class="card" id="grid-summary" style="display:none">
+        <h3>Color Pattern Comparison</h3>
+        <p id="grid-count-summary" style="color:var(--accent2);font-size:14px;"></p>
+        <p style="color:var(--text2);font-size:13px;margin-top:6px;">
+            Each pair will also be checked for color-agnostic pattern equivalence
+            using the calibrated grids. The pattern verdict is reported alongside SSIM.
+        </p>
     </div>
 
     <button class="btn btn-primary" id="run-btn" onclick="runComparison()" style="width:100%;padding:14px;font-size:16px;">
@@ -440,6 +549,89 @@ input::placeholder { color: #555; }
     </div>
 </div>
 
+<!-- ===== GRID EDITOR TAB ===== -->
+<div class="tab-content" id="tab-grids">
+    <div class="card">
+        <h3>Color Pattern Grid Calibration</h3>
+        <p style="color:var(--text2);font-size:14px;margin-bottom:14px;">
+            Draw the two ingredient grids on a sample screenshot. The tool will extract a
+            color-agnostic label pattern from each cell and compare patterns between
+            old &amp; new screenshots — so a re-colored level (same layout, different
+            palette) still passes.
+        </p>
+
+        <div class="form-group">
+            <label>Load a sample screenshot</label>
+            <div style="display:flex;gap:8px;align-items:center;">
+                <button class="btn btn-secondary btn-sm" onclick="loadGridSampleFromDir()">Load from Old folder</button>
+                <button class="btn btn-secondary btn-sm" onclick="loadGridConfig()">Load saved config…</button>
+            </div>
+        </div>
+
+        <div id="grid-canvas-container" style="display:none;">
+            <div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap;align-items:flex-end;">
+                <div>
+                    <label style="display:block;font-size:12px;color:var(--text2);">Grid name</label>
+                    <input type="text" id="grid-name" value="top" style="width:120px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:var(--text2);">Rows</label>
+                    <input type="number" id="grid-rows" value="7" min="1" max="20" style="width:80px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:var(--text2);">Cols</label>
+                    <input type="number" id="grid-cols" value="7" min="1" max="20" style="width:80px;">
+                </div>
+                <div style="font-size:13px;color:var(--text2);">
+                    Set rows/cols → then drag a rectangle around that grid on the image.
+                </div>
+            </div>
+
+            <div class="mask-editor" id="grid-editor">
+                <img id="grid-img" src="" alt="Sample screenshot">
+                <canvas id="grid-canvas"></canvas>
+            </div>
+
+            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-secondary btn-sm" onclick="undoLastGrid()">Undo Last Grid</button>
+                <button class="btn btn-danger btn-sm" onclick="clearAllGrids()">Clear All</button>
+                <div style="flex:1"></div>
+                <button class="btn btn-secondary btn-sm" onclick="runGridPreview()">Preview Pattern</button>
+                <button class="btn btn-primary btn-sm" onclick="saveGridConfig()">Save Config</button>
+            </div>
+
+            <details style="margin-top:12px;">
+                <summary style="cursor:pointer;color:var(--accent2);font-size:13px;">Advanced sampling options</summary>
+                <div style="display:flex;gap:12px;margin-top:10px;flex-wrap:wrap;">
+                    <div>
+                        <label style="display:block;font-size:12px;color:var(--text2);">Cell inset</label>
+                        <input type="number" id="grid-inset" value="0.20" min="0" max="0.45" step="0.01" style="width:80px;">
+                        <div style="font-size:11px;color:var(--text2);">Inner sample fraction</div>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:12px;color:var(--text2);">Sat threshold</label>
+                        <input type="number" id="grid-sat" value="0.25" min="0" max="1" step="0.01" style="width:80px;">
+                        <div style="font-size:11px;color:var(--text2);">Min saturation = ingredient pixel</div>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:12px;color:var(--text2);">Empty coverage</label>
+                        <input type="number" id="grid-empty" value="0.08" min="0" max="1" step="0.01" style="width:80px;">
+                        <div style="font-size:11px;color:var(--text2);">Below = empty cell</div>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:12px;color:var(--text2);">Max colors (k)</label>
+                        <input type="number" id="grid-maxk" value="8" min="2" max="12" step="1" style="width:80px;">
+                    </div>
+                </div>
+            </details>
+
+            <div class="mask-list" id="grid-list"></div>
+
+            <div id="grid-preview-result" style="margin-top:12px;display:none;"></div>
+        </div>
+    </div>
+</div>
+
 <!-- ===== RESULTS TAB ===== -->
 <div class="tab-content" id="tab-results">
     <div id="no-results" class="card" style="text-align:center;padding:60px;">
@@ -473,7 +665,7 @@ input::placeholder { color: #555; }
 // ===== Tab switching =====
 function showTab(name) {
     document.querySelectorAll('.tab').forEach((t, i) => {
-        const tabs = ['setup', 'masks', 'results'];
+        const tabs = ['setup', 'masks', 'grids', 'results'];
         t.classList.toggle('active', tabs[i] === name);
     });
     document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
@@ -776,6 +968,256 @@ async function saveMaskConfig() {
     } catch(e) { alert('Error: ' + e.message); }
 }
 
+// ===== Grid Editor =====
+let gridSpecs = [];                   // [{name, rows, cols, x, y, width, height}]
+let gridImgPath = '';                 // server-side path for preview API
+let gridImgNatW = 0, gridImgNatH = 0;
+let gridCanvas, gridCtx;
+let gridIsDrawing = false;
+let gridDrawStart = null;
+
+function initGridCanvas() {
+    const img = document.getElementById('grid-img');
+    gridCanvas = document.getElementById('grid-canvas');
+    gridCtx = gridCanvas.getContext('2d');
+    gridCanvas.width = img.naturalWidth;
+    gridCanvas.height = img.naturalHeight;
+    gridImgNatW = img.naturalWidth;
+    gridImgNatH = img.naturalHeight;
+
+    gridCanvas.onmousedown = (e) => {
+        gridIsDrawing = true;
+        gridDrawStart = getGridCanvasCoords(e);
+    };
+    gridCanvas.onmousemove = (e) => {
+        if (!gridIsDrawing) return;
+        const cur = getGridCanvasCoords(e);
+        drawAllGrids();
+        gridCtx.strokeStyle = 'rgba(108, 99, 255, 0.9)';
+        gridCtx.lineWidth = 2;
+        gridCtx.setLineDash([6, 3]);
+        gridCtx.strokeRect(gridDrawStart.x, gridDrawStart.y,
+                           cur.x - gridDrawStart.x, cur.y - gridDrawStart.y);
+        gridCtx.setLineDash([]);
+    };
+    gridCanvas.onmouseup = (e) => {
+        if (!gridIsDrawing) return;
+        gridIsDrawing = false;
+        const end = getGridCanvasCoords(e);
+        const x = Math.min(gridDrawStart.x, end.x);
+        const y = Math.min(gridDrawStart.y, end.y);
+        const w = Math.abs(end.x - gridDrawStart.x);
+        const h = Math.abs(end.y - gridDrawStart.y);
+        if (w > 20 && h > 20) {
+            const name = document.getElementById('grid-name').value.trim() || `grid${gridSpecs.length + 1}`;
+            const rows = parseInt(document.getElementById('grid-rows').value) || 7;
+            const cols = parseInt(document.getElementById('grid-cols').value) || 7;
+            gridSpecs.push({name, rows, cols,
+                            x: Math.round(x), y: Math.round(y),
+                            width: Math.round(w), height: Math.round(h)});
+            // Suggest defaults for the next grid
+            if (gridSpecs.length === 1) {
+                document.getElementById('grid-name').value = 'bottom';
+                document.getElementById('grid-rows').value = 5;
+                document.getElementById('grid-cols').value = 7;
+            }
+        }
+        drawAllGrids();
+        updateGridList();
+        updateGridSummary();
+    };
+}
+
+function getGridCanvasCoords(e) {
+    const rect = gridCanvas.getBoundingClientRect();
+    const scaleX = gridCanvas.width / rect.width;
+    const scaleY = gridCanvas.height / rect.height;
+    return {x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY};
+}
+
+function drawAllGrids() {
+    gridCtx.clearRect(0, 0, gridCanvas.width, gridCanvas.height);
+    gridSpecs.forEach((g, i) => {
+        gridCtx.fillStyle = 'rgba(108, 99, 255, 0.10)';
+        gridCtx.fillRect(g.x, g.y, g.width, g.height);
+        gridCtx.strokeStyle = 'rgba(108, 99, 255, 0.95)';
+        gridCtx.lineWidth = 2;
+        gridCtx.strokeRect(g.x, g.y, g.width, g.height);
+        // Cell lines
+        const cw = g.width / g.cols;
+        const ch = g.height / g.rows;
+        gridCtx.strokeStyle = 'rgba(108, 99, 255, 0.4)';
+        gridCtx.lineWidth = 1;
+        for (let c = 1; c < g.cols; c++) {
+            gridCtx.beginPath();
+            gridCtx.moveTo(g.x + c * cw, g.y);
+            gridCtx.lineTo(g.x + c * cw, g.y + g.height);
+            gridCtx.stroke();
+        }
+        for (let r = 1; r < g.rows; r++) {
+            gridCtx.beginPath();
+            gridCtx.moveTo(g.x, g.y + r * ch);
+            gridCtx.lineTo(g.x + g.width, g.y + r * ch);
+            gridCtx.stroke();
+        }
+        gridCtx.fillStyle = 'rgba(108, 99, 255, 0.95)';
+        gridCtx.font = '14px monospace';
+        gridCtx.fillText(`${g.name} (${g.rows}x${g.cols})`, g.x + 4, g.y + 16);
+    });
+}
+
+function updateGridList() {
+    const container = document.getElementById('grid-list');
+    container.innerHTML = '';
+    gridSpecs.forEach((g, i) => {
+        const div = document.createElement('div');
+        div.className = 'mask-item';
+        div.style.borderLeft = '3px solid rgba(108,99,255,0.8)';
+        div.innerHTML = `
+            <span style="color:#aab;">${g.name}</span>
+            <span>${g.rows}x${g.cols}</span>
+            <span>x:${g.x} y:${g.y} w:${g.width} h:${g.height}</span>
+            <span class="mask-remove" onclick="removeGrid(${i})">&times;</span>
+        `;
+        container.appendChild(div);
+    });
+}
+
+function updateGridSummary() {
+    const el = document.getElementById('grid-summary');
+    const countEl = document.getElementById('grid-count-summary');
+    if (gridSpecs.length > 0) {
+        el.style.display = '';
+        const names = gridSpecs.map(g => `${g.name} ${g.rows}x${g.cols}`).join(', ');
+        countEl.textContent = `${gridSpecs.length} grid(s): ${names}`;
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+function removeGrid(i) { gridSpecs.splice(i, 1); drawAllGrids(); updateGridList(); updateGridSummary(); }
+function undoLastGrid() { if (gridSpecs.length) gridSpecs.pop(); drawAllGrids(); updateGridList(); updateGridSummary(); }
+function clearAllGrids() { gridSpecs = []; drawAllGrids(); updateGridList(); updateGridSummary(); document.getElementById('grid-preview-result').style.display = 'none'; }
+
+async function loadGridSampleFromDir() {
+    const dir = document.getElementById('old-dir').value;
+    if (!dir) { alert('Set the Old Screenshots folder first'); return; }
+    try {
+        const res = await fetch('/api/sample-image-path', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: dir})
+        });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        gridImgPath = data.path;
+        loadGridImage('/api/serve-image?path=' + encodeURIComponent(data.path));
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+function loadGridImage(url) {
+    const img = document.getElementById('grid-img');
+    img.onload = () => {
+        document.getElementById('grid-canvas-container').style.display = '';
+        initGridCanvas();
+        drawAllGrids();
+    };
+    img.src = url;
+}
+
+function currentGridConfigObj() {
+    return {
+        imageWidth: gridImgNatW,
+        imageHeight: gridImgNatH,
+        grids: gridSpecs,
+        cellInsetPct: parseFloat(document.getElementById('grid-inset').value) || 0.20,
+        satThreshold: parseFloat(document.getElementById('grid-sat').value) || 0.25,
+        emptyCoveragePct: parseFloat(document.getElementById('grid-empty').value) || 0.08,
+        minK: 2,
+        maxK: parseInt(document.getElementById('grid-maxk').value) || 8,
+    };
+}
+
+async function runGridPreview() {
+    if (!gridImgPath) { alert('Load a sample image first'); return; }
+    if (gridSpecs.length === 0) { alert('Draw at least one grid first'); return; }
+    const result = document.getElementById('grid-preview-result');
+    result.style.display = '';
+    result.innerHTML = '<div style="color:var(--text2);">Analyzing…</div>';
+    try {
+        const res = await fetch('/api/preview-pattern', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({imagePath: gridImgPath, gridConfig: currentGridConfigObj()})
+        });
+        const data = await res.json();
+        if (data.error) { result.innerHTML = `<div class="error">${data.error}</div>`; return; }
+        let html = `<div style="color:var(--accent2);margin-bottom:8px;">Detected ${data.k} color(s).</div>`;
+        for (const [name, grid] of Object.entries(data.grids)) {
+            html += `<div style="margin-bottom:10px;"><b>${name}</b><pre style="background:var(--bg);padding:10px;border-radius:6px;font-family:monospace;font-size:13px;line-height:1.4;">`;
+            html += grid.map(row => row.join(' ')).join('\n');
+            html += `</pre></div>`;
+        }
+        if (data.palette && Object.keys(data.palette).length) {
+            html += `<div style="display:flex;gap:8px;flex-wrap:wrap;">`;
+            for (const [lbl, info] of Object.entries(data.palette)) {
+                const rgb = info.rgb || [128,128,128];
+                html += `<div style="display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--surface2);border-radius:6px;font-size:13px;">
+                    <span style="display:inline-block;width:18px;height:18px;border-radius:4px;background:rgb(${rgb[0]},${rgb[1]},${rgb[2]});border:1px solid #333;"></span>
+                    <span><b>${lbl}</b> · ${info.count} cells</span>
+                </div>`;
+            }
+            html += `</div>`;
+        }
+        result.innerHTML = html;
+    } catch(e) {
+        result.innerHTML = `<div class="error">${e.message}</div>`;
+    }
+}
+
+async function saveGridConfig() {
+    if (gridSpecs.length === 0) { alert('Draw at least one grid first'); return; }
+    const path = prompt('Save grid config as:', 'grid_config.json');
+    if (!path) return;
+    const payload = {path, ...currentGridConfigObj()};
+    try {
+        await fetch('/api/save-grid', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+        document.getElementById('grid-config-path').value = path;
+        alert('Saved: ' + path);
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function loadGridConfig() {
+    const path = prompt('Load grid config from:', 'grid_config.json');
+    if (!path) return;
+    try {
+        const res = await fetch('/api/load-grid', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path})
+        });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        gridImgNatW = data.imageWidth || 0;
+        gridImgNatH = data.imageHeight || 0;
+        gridSpecs = data.grids || [];
+        if (data.cellInsetPct !== undefined) document.getElementById('grid-inset').value = data.cellInsetPct;
+        if (data.satThreshold !== undefined) document.getElementById('grid-sat').value = data.satThreshold;
+        if (data.emptyCoveragePct !== undefined) document.getElementById('grid-empty').value = data.emptyCoveragePct;
+        if (data.maxK !== undefined) document.getElementById('grid-maxk').value = data.maxK;
+        document.getElementById('grid-config-path').value = path;
+        updateGridList();
+        updateGridSummary();
+        // If a sample was already loaded, redraw onto it.
+        if (gridCanvas) drawAllGrids();
+        alert('Loaded ' + (gridSpecs.length) + ' grid(s) from ' + path);
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
 // ===== Run comparison =====
 async function runComparison() {
     const oldDir = document.getElementById('old-dir').value;
@@ -783,6 +1225,22 @@ async function runComparison() {
     if (!oldDir || !newDir) { alert('Please set both screenshot folders'); return; }
 
     const hasRegions = masks.length > 0 || shifts.length > 0;
+    let gridConfig = null;
+    const gridConfigPath = document.getElementById('grid-config-path').value.trim();
+    if (gridConfigPath) {
+        try {
+            const res = await fetch('/api/load-grid', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: gridConfigPath})
+            });
+            const data = await res.json();
+            if (data.error) { alert('Grid config load failed: ' + data.error); return; }
+            gridConfig = data;
+        } catch(e) { alert('Grid config load failed: ' + e.message); return; }
+    } else if (gridSpecs.length > 0 && gridImgNatW > 0) {
+        gridConfig = currentGridConfigObj();
+    }
     const payload = {
         oldDir: oldDir,
         newDir: newDir,
@@ -793,6 +1251,7 @@ async function runComparison() {
         masks: masks.length > 0 ? masks : [],
         shifts: shifts.length > 0 ? shifts : [],
         maskImageSize: hasRegions ? [maskImgNatW, maskImgNatH] : null,
+        gridConfig: gridConfig,
     };
 
     document.getElementById('run-btn').disabled = true;
@@ -842,16 +1301,76 @@ async function pollStatus() {
     }
 }
 
+let resultsFilter = 'any-fail';
+let lastResults = null;
+
+function setResultsFilter(filter, btn) {
+    resultsFilter = filter;
+    document.querySelectorAll('.results-filter-btn').forEach(b => b.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+    if (lastResults) renderLevels(lastResults);
+}
+
+function renderLevels(results) {
+    const list = document.getElementById('levels-list');
+    if (!list) return;
+    const levels = results.levels || [];
+    const filtered = levels.filter(l => {
+        const ssimFail = !l.passed;
+        const patternFail = l.pattern_passed === false;
+        const anyFail = ssimFail || patternFail;
+        if (resultsFilter === 'all') return true;
+        if (resultsFilter === 'any-fail') return anyFail;
+        if (resultsFilter === 'ssim-fail') return ssimFail;
+        if (resultsFilter === 'pattern-fail') return patternFail;
+        if (resultsFilter === 'pass') return !anyFail;
+        return true;
+    });
+
+    if (filtered.length === 0) {
+        list.innerHTML = '<div style="padding:20px;color:var(--text2);text-align:center;">No levels match this filter.</div>';
+        return;
+    }
+
+    list.innerHTML = filtered.map(l => {
+        const pct = (l.score * 100).toFixed(2);
+        const ssimBadge = l.passed
+            ? '<span style="color:var(--green);font-weight:700;font-size:11px;">SSIM OK</span>'
+            : '<span style="color:var(--red);font-weight:700;font-size:11px;">SSIM FAIL</span>';
+        let patternBadge = '';
+        if (l.pattern_passed === true) {
+            patternBadge = '<span style="color:var(--accent2);font-weight:700;font-size:11px;">PATTERN OK</span>';
+        } else if (l.pattern_passed === false) {
+            patternBadge = `<span style="color:var(--orange);font-weight:700;font-size:11px;">PATTERN FAIL (${l.pattern_mismatches})</span>`;
+        }
+        return `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border);flex-wrap:wrap;">
+            ${ssimBadge}
+            ${patternBadge}
+            <span style="font-weight:600;min-width:120px;">${l.level}</span>
+            <span style="color:var(--text2);font-family:monospace;font-size:13px;">SSIM: ${l.score.toFixed(6)}</span>
+            <span style="color:var(--orange);font-size:13px;">${l.change_pct}% changed</span>
+            <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;max-width:200px;">
+                <div style="height:100%;width:${pct}%;background:${l.passed ? 'var(--green)' : 'var(--red)'};border-radius:3px;"></div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
 function showResults(results) {
+    lastResults = results;
     document.getElementById('no-results').style.display = 'none';
     const container = document.getElementById('results-content');
     container.style.display = '';
 
+    const patternEnabled = !!results.pattern_enabled;
+    const patternFailed = results.pattern_failed || 0;
+
     let html = `
         <div class="results-summary">
             <div class="result-stat total"><div class="num">${results.total}</div><div class="lbl">Total</div></div>
-            <div class="result-stat pass"><div class="num">${results.passed}</div><div class="lbl">Passed</div></div>
-            <div class="result-stat fail"><div class="num">${results.failed}</div><div class="lbl">Failed</div></div>
+            <div class="result-stat pass"><div class="num">${results.passed}</div><div class="lbl">SSIM Passed</div></div>
+            <div class="result-stat fail"><div class="num">${results.failed}</div><div class="lbl">SSIM Failed</div></div>
+            ${patternEnabled ? `<div class="result-stat fail"><div class="num">${patternFailed}</div><div class="lbl">Pattern Failed</div></div>` : ''}
         </div>
     `;
 
@@ -863,27 +1382,21 @@ function showResults(results) {
         </div>`;
     }
 
-    if (results.levels) {
-        const failed = results.levels.filter(l => !l.passed);
-        if (failed.length > 0) {
-            html += '<div class="card"><h3>Failed Levels</h3>';
-            failed.forEach(l => {
-                const pct = (l.score * 100).toFixed(2);
-                html += `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border);">
-                    <span style="color:var(--red);font-weight:700;font-size:12px;">FAIL</span>
-                    <span style="font-weight:600;min-width:120px;">${l.level}</span>
-                    <span style="color:var(--text2);font-family:monospace;font-size:13px;">SSIM: ${l.score.toFixed(6)}</span>
-                    <span style="color:var(--orange);font-size:13px;">${l.change_pct}% changed</span>
-                    <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;max-width:200px;">
-                        <div style="height:100%;width:${pct}%;background:var(--red);border-radius:3px;"></div>
-                    </div>
-                </div>`;
-            });
-            html += '</div>';
-        }
-    }
+    html += `<div class="card">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
+            <h3 style="margin:0;flex:1;">Levels</h3>
+            <button class="filter-btn results-filter-btn" onclick="setResultsFilter('all', this)">All</button>
+            <button class="filter-btn results-filter-btn active" onclick="setResultsFilter('any-fail', this)">Any failure</button>
+            <button class="filter-btn results-filter-btn" onclick="setResultsFilter('ssim-fail', this)">SSIM fails only</button>
+            ${patternEnabled ? `<button class="filter-btn results-filter-btn" onclick="setResultsFilter('pattern-fail', this)">Pattern fails only</button>` : ''}
+            <button class="filter-btn results-filter-btn" onclick="setResultsFilter('pass', this)">Passed only</button>
+        </div>
+        <div id="levels-list"></div>
+    </div>`;
 
     container.innerHTML = html;
+    resultsFilter = 'any-fail';
+    renderLevels(results);
 }
 </script>
 </body>

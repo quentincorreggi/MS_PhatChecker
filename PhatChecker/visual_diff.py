@@ -26,6 +26,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 from skimage.metrics import structural_similarity as ssim
 
+import color_pattern
+
 
 # ---------------------------------------------------------------------------
 # Mask & shift support
@@ -202,10 +204,13 @@ def create_amplified_diff(pixel_diff):
 # ---------------------------------------------------------------------------
 
 def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=False,
-                   masks=None, mask_image_size=None, shifts=None):
+                   masks=None, mask_image_size=None, shifts=None, grid_config_dict=None):
     """
     Compare one pair. Returns a result dict.
     Only generates diff images for FAILed levels (unless save_pass=True).
+
+    If grid_config_dict is provided, also performs color-agnostic pattern
+    analysis and reports a separate pattern_passed verdict alongside SSIM.
     """
     os.makedirs(output_dir, exist_ok=True)
     basename = os.path.splitext(os.path.basename(old_path))[0]
@@ -224,6 +229,7 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
             "changed_pixels": 0,
             "change_pct": 0,
             "images": {},
+            "pattern": None,
         }
 
     size_warning = None
@@ -285,6 +291,48 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
         thumb.save(p)
         images[tag] = p
 
+    # ---- Color-agnostic pattern analysis (optional) ----
+    pattern_block = None
+    if grid_config_dict:
+        try:
+            config = color_pattern.GridConfig.from_dict(grid_config_dict)
+            old_pattern = color_pattern.analyze(old_path, config)
+            new_pattern = color_pattern.analyze(new_path, config)
+            diff = color_pattern.compare(old_pattern, new_pattern)
+
+            pattern_images = {}
+            if not diff.passed or save_pass:
+                side = color_pattern.render_side_by_side_labels(old_pattern, new_pattern, diff)
+                p = os.path.join(output_dir, f"{basename}_pattern_labels.png")
+                side.save(p)
+                pattern_images["labels"] = p
+
+                overlay = color_pattern.render_mismatch_overlay(new_path, new_pattern, diff, config)
+                p = os.path.join(output_dir, f"{basename}_pattern_mismatch.png")
+                overlay.save(p)
+                pattern_images["mismatch"] = p
+
+            pattern_block = {
+                "passed": bool(diff.passed),
+                "score": float(diff.score),
+                "matched_cells": int(diff.matched_cells),
+                "total_cells": int(diff.total_cells),
+                "mismatches": int(diff.total_cells - diff.matched_cells),
+                "mapping": diff.mapping,
+                "k_old": old_pattern.k,
+                "k_new": new_pattern.k,
+                "grids_old": old_pattern.grids,
+                "grids_new": new_pattern.grids,
+                "images": pattern_images,
+                "error": diff.error,
+            }
+        except Exception as e:
+            pattern_block = {
+                "passed": False, "score": 0.0,
+                "matched_cells": 0, "total_cells": 0, "mismatches": 0,
+                "mapping": {}, "images": {}, "error": str(e),
+            }
+
     return {
         "level": basename,
         "old_path": old_path,
@@ -296,6 +344,7 @@ def run_comparison(old_path, new_path, output_dir, threshold=0.995, save_pass=Fa
         "size_warning": size_warning,
         "error": None,
         "images": images,
+        "pattern": pattern_block,
     }
 
 
@@ -371,7 +420,7 @@ def find_pairs(old_dir, new_dir):
 
 
 def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pass=False,
-              masks=None, mask_image_size=None, shifts=None):
+              masks=None, mask_image_size=None, shifts=None, grid_config_dict=None):
     """Process all matched pairs, return list of results."""
     pairs, only_old, only_new = find_pairs(old_dir, new_dir)
 
@@ -389,6 +438,9 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
         print(f"  Using {len(masks)} mask region(s)")
     if shifts:
         print(f"  Using {len(shifts)} shift correction(s)")
+    if grid_config_dict:
+        n_grids = len(grid_config_dict.get("grids", []))
+        print(f"  Color pattern mode: ON ({n_grids} grid(s))")
     if only_old:
         print(f"  Warning: {len(only_old)} files only in old dir (missing from new)")
     if only_new:
@@ -396,7 +448,8 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
     print()
 
     tasks = [
-        (old_p, new_p, diff_dir, threshold, save_pass, masks, mask_image_size, shifts)
+        (old_p, new_p, diff_dir, threshold, save_pass, masks, mask_image_size, shifts,
+         grid_config_dict)
         for old_p, new_p in pairs
     ]
     results = []
@@ -409,7 +462,11 @@ def run_batch(old_dir, new_dir, output_dir, threshold=0.995, workers=4, save_pas
             done_count += 1
             result = future.result()
             status = "PASS" if result["passed"] else "FAIL"
-            print(f"  [{done_count:>4}/{len(pairs)}] {status}  SSIM={result['score']:.4f}  {result['level']}")
+            extra = ""
+            if result.get("pattern"):
+                pp = result["pattern"]["passed"]
+                extra = f"  PATTERN={'PASS' if pp else 'FAIL'}"
+            print(f"  [{done_count:>4}/{len(pairs)}] {status}  SSIM={result['score']:.4f}{extra}  {result['level']}")
             results.append(result)
 
     elapsed = time.time() - start
@@ -430,6 +487,13 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     failed = [r for r in results if not r["passed"]]
     passed = [r for r in results if r["passed"]]
 
+    pattern_enabled = any(r.get("pattern") is not None for r in results)
+    pattern_failed = [r for r in results if r.get("pattern") and not r["pattern"]["passed"]]
+    pattern_passed_list = [r for r in results if r.get("pattern") and r["pattern"]["passed"]]
+    ssim_only_failed = [r for r in failed if not (r.get("pattern") and not r["pattern"]["passed"])]
+    pattern_only_failed = [r for r in pattern_failed if r["passed"]]
+    any_failed = [r for r in results if (not r["passed"]) or (r.get("pattern") and not r["pattern"]["passed"])]
+
     report_path = os.path.join(output_dir, "report.html")
 
     def img_tag(path, alt="", css_class="thumb"):
@@ -443,13 +507,54 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
         color = "#4caf50" if score >= threshold else ("#ff9800" if score >= threshold * 0.98 else "#f44336")
         return f'''<div class="score-bar-bg"><div class="score-bar-fill" style="width:{pct}%;background:{color}"></div></div>'''
 
+    def pattern_badge(r):
+        p = r.get("pattern")
+        if not p:
+            return ""
+        if p["passed"]:
+            return '<span class="status-badge pattern-pass">PATTERN OK</span>'
+        return f'<span class="status-badge pattern-fail">PATTERN FAIL ({p["mismatches"]}/{p["total_cells"]})</span>'
+
+    def pattern_section_html(r):
+        p = r.get("pattern")
+        if not p:
+            return ""
+        if p.get("error"):
+            return f'<div class="error">Pattern error: {p["error"]}</div>'
+        mapping_str = ", ".join(f"{k}→{v}" for k, v in sorted((p.get("mapping") or {}).items())) or "—"
+        return f'''
+            <div class="diff-section pattern-block">
+                <div class="diff-label">Color Pattern ({p["matched_cells"]}/{p["total_cells"]} cells match · mapping: {mapping_str})</div>
+                {img_tag(p["images"].get("labels"), 'label grids', 'full-img')}
+                {img_tag(p["images"].get("mismatch"), 'mismatch overlay', 'full-img')}
+            </div>'''
+
+    def card_classes(r):
+        cls = ["level-card"]
+        ssim_fail = not r["passed"]
+        pattern_fail = bool(r.get("pattern") and not r["pattern"]["passed"])
+        if ssim_fail:
+            cls.append("ssim-fail")
+        else:
+            cls.append("ssim-pass")
+        if pattern_fail:
+            cls.append("pattern-fail")
+        elif r.get("pattern"):
+            cls.append("pattern-pass")
+        if ssim_fail or pattern_fail:
+            cls.append("fail")
+        else:
+            cls.append("pass")
+        return " ".join(cls)
+
     rows_failed = ""
     for r in failed:
         imgs = r["images"]
         rows_failed += f'''
-        <div class="level-card fail" onclick="this.classList.toggle('expanded')">
+        <div class="{card_classes(r)}" onclick="this.classList.toggle('expanded')">
             <div class="card-header">
-                <span class="status-badge fail">FAIL</span>
+                <span class="status-badge fail">SSIM FAIL</span>
+                {pattern_badge(r)}
                 <span class="level-name">{r['level']}</span>
                 <span class="score">SSIM: {r['score']:.6f}</span>
                 <span class="change-pct">{r['change_pct']:.2f}% changed</span>
@@ -479,19 +584,46 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
                         <div class="diff-label">Amplified Diff</div>
                         {img_tag(imgs.get('amplified'), 'amplified', 'full-img')}
                     </div>
+                    {pattern_section_html(r)}
                 </div>
                 {f'<div class="warning">{r["size_warning"]}</div>' if r.get("size_warning") else ""}
                 {f'<div class="error">Error: {r["error"]}</div>' if r.get("error") else ""}
             </div>
         </div>'''
 
+    rows_pattern_only = ""
+    for r in pattern_only_failed:
+        imgs = r["images"]
+        rows_pattern_only += f'''
+        <div class="{card_classes(r)}" onclick="this.classList.toggle('expanded')">
+            <div class="card-header">
+                <span class="status-badge pass">SSIM OK</span>
+                {pattern_badge(r)}
+                <span class="level-name">{r['level']}</span>
+                <span class="score">SSIM: {r['score']:.6f}</span>
+                {score_bar(r['score'], threshold)}
+            </div>
+            <div class="card-details">
+                <div class="thumbs">
+                    <div class="thumb-col"><div class="thumb-label">Old</div>{img_tag(imgs.get('thumb_old'), 'old')}</div>
+                    <div class="thumb-col"><div class="thumb-label">New</div>{img_tag(imgs.get('thumb_new'), 'new')}</div>
+                </div>
+                <div class="diff-images">
+                    {pattern_section_html(r)}
+                </div>
+            </div>
+        </div>'''
+
     rows_passed = ""
     for r in passed:
+        if r.get("pattern") and not r["pattern"]["passed"]:
+            continue  # shown in the pattern-only section above
         imgs = r["images"]
         rows_passed += f'''
-        <div class="level-card pass">
+        <div class="{card_classes(r)}">
             <div class="card-header">
                 <span class="status-badge pass">PASS</span>
+                {pattern_badge(r)}
                 <span class="level-name">{r['level']}</span>
                 <span class="score">SSIM: {r['score']:.6f}</span>
                 {score_bar(r['score'], threshold)}
@@ -548,6 +680,10 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
     .status-badge {{ font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 4px; }}
     .status-badge.fail {{ background: #f4433622; color: #f44336; }}
     .status-badge.pass {{ background: #4caf5022; color: #4caf50; }}
+    .status-badge.pattern-pass {{ background: #2196f322; color: #64b5f6; }}
+    .status-badge.pattern-fail {{ background: #ff980022; color: #ff9800; }}
+    .level-card.pattern-fail {{ border-right: 4px solid #ff9800; }}
+    .pattern-block {{ background: #1a2333; border-radius: 8px; padding: 12px; margin-top: 8px; }}
     .level-name {{ font-weight: 600; min-width: 120px; }}
     .score {{ color: #888; font-size: 13px; font-family: monospace; }}
     .change-pct {{ color: #ff9800; font-size: 13px; }}
@@ -582,21 +718,25 @@ def generate_html_report(results, only_old, only_new, output_dir, threshold):
 </div>
 <div class="summary">
     <div class="summary-card total"><div class="number">{total}</div><div class="label">Total Levels</div></div>
-    <div class="summary-card fail"><div class="number">{len(failed)}</div><div class="label">Failed</div></div>
-    <div class="summary-card pass"><div class="number">{len(passed)}</div><div class="label">Passed</div></div>
+    <div class="summary-card fail"><div class="number">{len(failed)}</div><div class="label">SSIM Failed</div></div>
+    {f'<div class="summary-card warn"><div class="number">{len(pattern_failed)}</div><div class="label">Pattern Failed</div></div>' if pattern_enabled else ''}
+    <div class="summary-card pass"><div class="number">{len(passed)}</div><div class="label">SSIM Passed</div></div>
     <div class="summary-card warn"><div class="number">{len(only_old) + len(only_new)}</div><div class="label">Missing</div></div>
 </div>
 <div class="filter-bar">
     <input type="text" id="search" placeholder="Search levels..." oninput="filterLevels()">
     <button class="filter-btn active" onclick="setFilter('all', this)">All</button>
-    <button class="filter-btn" onclick="setFilter('fail', this)">Failures only</button>
+    <button class="filter-btn" onclick="setFilter('any-fail', this)">Any failure</button>
+    <button class="filter-btn" onclick="setFilter('ssim-fail', this)">SSIM fails only</button>
+    {'<button class="filter-btn" onclick="setFilter(' + chr(39) + 'pattern-fail' + chr(39) + ', this)">Pattern fails only</button>' if pattern_enabled else ''}
     <button class="filter-btn" onclick="setFilter('pass', this)">Passed only</button>
 </div>
 {missing_html}
 <div class="section" id="results-section">
-    <h2>Failed ({len(failed)})</h2>
+    <h2>SSIM Failures ({len(failed)})</h2>
     <div id="failed-list">{rows_failed}</div>
-    <h2 style="margin-top:30px">Passed ({len(passed)})</h2>
+    {('<h2 style="margin-top:30px">Pattern Failures only (SSIM passed) (' + str(len(pattern_only_failed)) + ')</h2><div id="pattern-only-list">' + rows_pattern_only + '</div>') if pattern_enabled else ''}
+    <h2 style="margin-top:30px">Passed ({total - len(any_failed)})</h2>
     <div id="passed-list">{rows_passed}</div>
 </div>
 <div class="lightbox" id="lightbox" onclick="this.classList.remove('active')">
@@ -622,8 +762,14 @@ function filterLevels() {{
     document.querySelectorAll('.level-card').forEach(card => {{
         const name = card.querySelector('.level-name')?.textContent.toLowerCase() || '';
         const matchesSearch = !query || name.includes(query);
-        const isFail = card.classList.contains('fail');
-        const matchesFilter = currentFilter === 'all' || (currentFilter === 'fail' && isFail) || (currentFilter === 'pass' && !isFail);
+        const ssimFail = card.classList.contains('ssim-fail');
+        const patternFail = card.classList.contains('pattern-fail');
+        const anyFail = ssimFail || patternFail;
+        let matchesFilter = true;
+        if (currentFilter === 'any-fail')      matchesFilter = anyFail;
+        else if (currentFilter === 'ssim-fail')    matchesFilter = ssimFail;
+        else if (currentFilter === 'pattern-fail') matchesFilter = patternFail;
+        else if (currentFilter === 'pass')         matchesFilter = !anyFail;
         card.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
     }});
 }}
@@ -665,6 +811,8 @@ Examples:
                         help="Also save diff images for passed levels")
     parser.add_argument("--mask", "-m", default=None,
                         help="Path to mask config JSON (from the web UI)")
+    parser.add_argument("--grid-config", "-g", default=None,
+                        help="Path to grid config JSON for color-agnostic pattern comparison")
     args = parser.parse_args()
 
     masks = None
@@ -675,6 +823,14 @@ Examples:
         masks = config.get("masks") or None
         shifts = config.get("shifts") or None
 
+    grid_config_dict = None
+    if args.grid_config:
+        if not os.path.exists(args.grid_config):
+            print(f"Error: grid config not found: {args.grid_config}")
+            sys.exit(1)
+        with open(args.grid_config, "r") as f:
+            grid_config_dict = json.load(f)
+
     if args.single:
         if not os.path.isfile(args.old):
             print(f"Error: File not found: {args.old}")
@@ -684,9 +840,15 @@ Examples:
             sys.exit(1)
         result = run_comparison(args.old, args.new, args.output_dir, args.threshold,
                                 save_pass=True, masks=masks, mask_image_size=mask_image_size,
-                                shifts=shifts)
+                                shifts=shifts, grid_config_dict=grid_config_dict)
         status = "PASS" if result["passed"] else "FAIL"
         print(f"\n{status}  SSIM: {result['score']:.6f}  Changed: {result['change_pct']:.2f}%")
+        if result.get("pattern"):
+            p = result["pattern"]
+            pstatus = "PASS" if p["passed"] else "FAIL"
+            mapping = p.get("mapping") or {}
+            print(f"PATTERN {pstatus}  matched {p['matched_cells']}/{p['total_cells']} cells  "
+                  f"mapping={mapping}")
     else:
         if not os.path.isdir(args.old):
             print(f"Error: Not a directory: {args.old}")
@@ -697,14 +859,17 @@ Examples:
 
         results, only_old, only_new = run_batch(
             args.old, args.new, args.output_dir, args.threshold, args.workers, args.save_pass,
-            masks, mask_image_size, shifts
+            masks, mask_image_size, shifts, grid_config_dict
         )
 
         failed = [r for r in results if not r["passed"]]
         passed = [r for r in results if r["passed"]]
+        pattern_failed = [r for r in results if r.get("pattern") and not r["pattern"]["passed"]]
 
         print(f"\n{'='*60}")
-        print(f"  Total: {len(results)}  |  Passed: {len(passed)}  |  Failed: {len(failed)}")
+        print(f"  Total: {len(results)}  |  SSIM Passed: {len(passed)}  |  SSIM Failed: {len(failed)}")
+        if grid_config_dict:
+            print(f"  Pattern Failed: {len(pattern_failed)}")
         if only_old:
             print(f"  Missing from new: {len(only_old)}")
         if only_new:

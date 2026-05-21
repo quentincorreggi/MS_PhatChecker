@@ -4,6 +4,8 @@ A tool for comparing game level screenshots side by side to catch visual regress
 
 It comes with two interfaces: a **web UI** (recommended for most users) and a **CLI** for scripting or CI pipelines.
 
+It also supports a **color-agnostic pattern check** for grid-based levels: the screen is divided into one or more grids (e.g. a 7×7 top grid and a 5×7 bottom grid), each cell's ingredient color is detected, and two screenshots are considered equivalent if their grids share the same layout under any permutation of colors. This way, a re-colored level (same shapes, different palette) still passes — and a single cell out of place is flagged.
+
 ---
 
 ## Quick Start
@@ -92,6 +94,15 @@ python3 visual_diff.py old_screenshots/ new_screenshots/
 python3 visual_diff.py old/ new/ --mask mask_config.json
 ```
 
+### Compare with color-agnostic pattern check
+
+```bash
+python3 visual_diff.py old/ new/ --grid-config grid_config.json
+```
+
+Each pair gets an SSIM verdict AND a pattern verdict. The HTML report has filter
+buttons for "SSIM fails only", "Pattern fails only", and "Any failure".
+
 ### Compare a single pair of images
 
 ```bash
@@ -110,6 +121,7 @@ python3 visual_diff.py --single old/level_190.png new/level_190.png
 | `--workers`, `-w` | `4` | Number of parallel worker processes |
 | `--save-pass` | off | Generate diff images for passed levels too |
 | `--mask`, `-m` | none | Path to a mask config JSON file |
+| `--grid-config`, `-g` | none | Path to a grid config JSON file (enables color-agnostic pattern check) |
 
 ---
 
@@ -124,6 +136,33 @@ The tool matches old and new screenshots by extracting a **level key** from each
 This means filenames don't need to be identical — as long as they share the same level number prefix, they'll be paired. Files that exist in only one folder are reported as "missing".
 
 ---
+
+## Grid Config Format
+
+Created via the web UI's **Grid Editor** tab, or written by hand:
+
+```json
+{
+  "imageWidth": 1080,
+  "imageHeight": 1920,
+  "grids": [
+    { "name": "top",    "rows": 7, "cols": 7, "x":  60, "y":  200, "width": 960, "height": 960 },
+    { "name": "bottom", "rows": 5, "cols": 7, "x":  60, "y": 1300, "width": 960, "height": 680 }
+  ],
+  "cellInsetPct": 0.20,
+  "satThreshold": 0.25,
+  "emptyCoveragePct": 0.08,
+  "hueGapDeg": 30.0,
+  "maxK": 8
+}
+```
+
+- `grids` — each grid defines a region and its rows/cols. Coordinates are in the calibration image's pixel space and scaled automatically for differently-sized screenshots.
+- `cellInsetPct` — inner fraction of each cell used for sampling (avoids border bleed).
+- `satThreshold` — pixels with HSV saturation below this are treated as background and skipped.
+- `emptyCoveragePct` — if fewer than this fraction of cell pixels pass the saturation threshold, the cell is marked empty.
+- `hueGapDeg` — two cells whose hues differ by less than this end up in the same color cluster. ~30° works for distinct ingredient colors with gradients/shadows.
+- `maxK` — hard cap on the number of distinct colors per image (used to merge over-segmented clusters and bound the comparison cost).
 
 ## Mask Config Format
 
